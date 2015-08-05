@@ -1,0 +1,10 @@
+{
+    "name": "root/jeremyvaught.net",
+    "authors": [
+        {
+            "name": "Jeremy Vaught",
+            "email": "jeremy@jeremyvaught.com"
+        }
+    ],
+    "require": {}
+}
