@@ -2,11 +2,20 @@
 
 namespace App\Console\Commands;
 
+use Illuminate\Auth\Middleware\Authenticate;
+use Illuminate\Auth\Middleware\EnsureEmailIsVerified;
+use Illuminate\Auth\Middleware\RedirectIfAuthenticated;
 use Illuminate\Console\Command;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Request;
 use Illuminate\Routing\Route as RoutingRoute;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
+use InvalidArgumentException;
+use JsonException;
+use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 /**
  * Save the site's public pages as plain HTML files in public/, so nginx serves
@@ -37,22 +46,67 @@ class ExportStaticPages extends Command
 
     public function handle(): int
     {
-        $paths = $this->option('path') ?: $this->discoverPaths();
-        $written = [];
+        try {
+            $paths = $this->input->getOption('path');
+            if (! is_array($paths)) {
+                throw new InvalidArgumentException('Page paths must be a list.');
+            }
+            $paths = $paths ?: $this->discoverPaths();
+            $files = [];
+            foreach ($paths as $path) {
+                if (! is_string($path)) {
+                    throw new InvalidArgumentException('Page paths must be strings.');
+                }
+                $path = '/'.ltrim($path, '/');
+                $relative = $this->fileFor($path);
+                $this->safeFile($relative);
+                $files[$path] = $relative;
+            }
+            $previous = $this->previousFiles();
+            $manifest = $this->safeFile(self::MANIFEST);
+        } catch (InvalidArgumentException|JsonException $exception) {
+            $this->components->error($exception->getMessage());
+
+            return self::FAILURE;
+        }
 
         if ($this->option('dry-run')) {
-            foreach ($paths as $path) {
-                $this->components->twoColumnDetail('/'.ltrim($path, '/'), 'public/'.$this->fileFor($path));
+            foreach ($files as $path => $relative) {
+                $this->components->twoColumnDetail($path, 'public/'.$relative);
             }
 
             return self::SUCCESS;
         }
 
-        foreach ($paths as $path) {
-            $path = '/'.ltrim($path, '/');
-            $response = Http::withHeaders(['User-Agent' => 'site-export'])
-                ->timeout(30)
-                ->get(rtrim(config('app.url'), '/').'/index.php'.$path);
+        // Finish all HTTP reads before changing files. A server/network failure
+        // must retain the previous exports and manifest for this release.
+        $pages = [];
+        foreach ($files as $path => $relative) {
+            try {
+                $route = Route::getRoutes()->match(Request::create(rtrim(config('app.url'), '/').$path, 'GET'));
+                if ($this->protectedRoute($route)) {
+                    $this->components->warn("Skipped {$path} (protected or runtime route)");
+
+                    continue;
+                }
+            } catch (NotFoundHttpException|MethodNotAllowedHttpException) {
+                // Explicit paths may be absent locally; the HTTP status gates them.
+            }
+            try {
+                $response = Http::withHeaders(['User-Agent' => 'site-export'])
+                    ->withoutRedirecting()
+                    ->timeout(30)
+                    ->get(rtrim(config('app.url'), '/').'/index.php'.$path);
+            } catch (ConnectionException) {
+                $this->components->error("Could not fetch {$path}; previous exports retained.");
+
+                return self::FAILURE;
+            }
+            if ($response->serverError()) {
+                $this->components->error("Could not fetch {$path} ({$response->status()}); previous exports retained.");
+
+                return self::FAILURE;
+            }
 
             $type = (string) $response->header('Content-Type');
             if ($response->status() !== 200 || ! str_starts_with($type, 'text/html')) {
@@ -60,40 +114,38 @@ class ExportStaticPages extends Command
 
                 continue;
             }
-
-            // Never freeze per-visitor content: forms with CSRF tokens, Livewire, etc.
             if ($reason = $this->dynamicMarker($response->body())) {
                 $this->components->warn("Skipped {$path} (contains {$reason}; leave it to Laravel)");
 
                 continue;
             }
-
-            $relative = $this->fileFor($path);
-            $written[] = $relative;
-
-            File::ensureDirectoryExists(dirname(public_path($relative)));
-            File::put(public_path($relative), $response->body());
-            $this->components->twoColumnDetail($path, "public/{$relative}");
+            $pages[$relative] = $response->body();
         }
 
-        $this->removeStaleFiles($written);
-        File::put(public_path(self::MANIFEST), json_encode(array_values($written), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-
+        foreach ($pages as $relative => $body) {
+            File::ensureDirectoryExists(dirname($this->safeFile($relative)));
+            File::put($this->safeFile($relative), $body);
+            $this->components->twoColumnDetail($relative, "public/{$relative}");
+        }
+        $written = array_keys($pages);
+        foreach ($previous as $old) {
+            if (! in_array($old, $written, true)) {
+                File::delete($this->safeFile($old));
+            }
+        }
+        File::put($manifest, json_encode($written, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         $this->components->info(count($written).' page(s) exported.');
 
         return self::SUCCESS;
     }
 
-    /** Public GET routes with no parameters and no auth/guest middleware. */
+    /** @return list<string> Public GET routes with no parameters or protected middleware. */
     private function discoverPaths(): array
     {
-        return collect(Route::getRoutes()->getRoutes())
+        return array_values(collect(Route::getRoutes()->getRoutes())
             ->filter(fn (RoutingRoute $route) => in_array('GET', $route->methods(), true))
             ->reject(fn (RoutingRoute $route) => str_contains($route->uri(), '{'))
-            ->reject(fn (RoutingRoute $route) => collect($route->gatherMiddleware())
-                ->contains(fn ($m) => is_string($m) && (str_starts_with($m, 'auth') || str_starts_with($m, 'guest') || $m === 'verified')))
-            ->reject(fn (RoutingRoute $route) => collect(self::SKIP_PREFIXES)
-                ->contains(fn ($prefix) => $route->uri() === $prefix || str_starts_with($route->uri(), $prefix.'/')))
+            ->reject(fn (RoutingRoute $route) => $this->protectedRoute($route))
             // Livewire/Flux asset routes carry a random suffix, e.g. livewire-16741e36/livewire.js
             ->reject(fn (RoutingRoute $route) => preg_match('#^(livewire|flux)[-/]#', $route->uri()) === 1)
             // Only page-like paths: no file extension other than .html
@@ -101,14 +153,14 @@ class ExportStaticPages extends Command
             ->map(fn (RoutingRoute $route) => '/'.ltrim($route->uri(), '/'))
             ->unique()
             ->values()
-            ->all();
+            ->all());
     }
 
     /** Markers of content that must not be shared between visitors, or null if the page is safe to freeze. */
     private function dynamicMarker(string $html): ?string
     {
         $markers = [
-            'a CSRF token' => '/name=["\']_token["\']|name=["\']csrf-token["\']|data-csrf=/i',
+            'a CSRF token' => '/\bname\s*=\s*(?:["\'](?:_token|csrf-token)["\']|(?:_token|csrf-token)(?=\s|\/?>))|\bdata-csrf\s*=/i',
             'Livewire' => '/wire:(?:id|snapshot|model|click|submit)|livewire:/i',
         ];
 
@@ -124,6 +176,9 @@ class ExportStaticPages extends Command
     /** "/" → index.html, "/about" → about/index.html, "/404.html" → 404.html */
     private function fileFor(string $path): string
     {
+        if (! preg_match('#^/[a-zA-Z0-9_/-]*(?:\.html)?$#', $path) || str_contains($path, '//')) {
+            throw new InvalidArgumentException('Unsafe page path.');
+        }
         $path = trim($path, '/');
 
         if ($path === '') {
@@ -133,19 +188,60 @@ class ExportStaticPages extends Command
         return str_ends_with($path, '.html') ? $path : $path.'/index.html';
     }
 
-    /** Delete files written by a previous export that are no longer exported (non zero-downtime sites). */
-    private function removeStaleFiles(array $written): void
+    private function protectedRoute(RoutingRoute $route): bool
     {
-        $manifest = public_path(self::MANIFEST);
-        if (! File::exists($manifest)) {
-            return;
-        }
+        return collect($route->gatherMiddleware())->contains(function ($middleware): bool {
+            if (! is_string($middleware)) {
+                return false;
+            }
+            $name = explode(':', ltrim($middleware, '\\'), 2)[0];
 
-        foreach (json_decode(File::get($manifest), true) ?: [] as $old) {
-            if (! in_array($old, $written, true) && File::exists(public_path($old))) {
-                File::delete(public_path($old));
-                $this->components->twoColumnDetail("removed public/{$old}", 'stale');
+            return str_starts_with($name, 'auth') || str_starts_with($name, 'guest') || $name === 'verified'
+                || in_array($name, [Authenticate::class, EnsureEmailIsVerified::class, RedirectIfAuthenticated::class], true);
+        }) || collect(self::SKIP_PREFIXES)->contains(fn ($prefix) => $route->uri() === $prefix || str_starts_with($route->uri(), $prefix.'/'));
+    }
+
+    /** Resolve only exported HTML files (or the manifest), never traversal or symlinks. */
+    private function safeFile(string $relative): string
+    {
+        if ($relative !== self::MANIFEST && preg_match('#^(?:[a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+\.html$#', $relative) !== 1) {
+            throw new InvalidArgumentException('Unsafe static export filename.');
+        }
+        $root = realpath(public_path());
+        if ($root === false) {
+            throw new InvalidArgumentException('Public directory is missing.');
+        }
+        $path = $root;
+        foreach (explode('/', $relative) as $part) {
+            $path .= '/'.$part;
+            if (is_link($path)) {
+                throw new InvalidArgumentException('Static export paths cannot contain symlinks.');
             }
         }
+
+        return $path;
+    }
+
+    /** @return list<string> */
+    private function previousFiles(): array
+    {
+        $manifest = $this->safeFile(self::MANIFEST);
+        if (! File::exists($manifest)) {
+            return [];
+        }
+        $previous = json_decode(File::get($manifest), true, 512, JSON_THROW_ON_ERROR);
+        if (! is_array($previous) || ! array_is_list($previous)) {
+            throw new InvalidArgumentException('Static export manifest must be a list of HTML files.');
+        }
+        $files = [];
+        foreach ($previous as $old) {
+            if (! is_string($old) || $old === self::MANIFEST) {
+                throw new InvalidArgumentException('Static export manifest filenames must be strings.');
+            }
+            $this->safeFile($old);
+            $files[] = $old;
+        }
+
+        return $files;
     }
 }
