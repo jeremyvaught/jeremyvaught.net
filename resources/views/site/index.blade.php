@@ -1,4 +1,4 @@
-<!doctype html>
+@verbatim<!doctype html>
 <html>
 <head>
 <!-- Google Tag Manager -->
@@ -187,3 +187,4 @@ ul.connect {
 		dark chocolate enthusiast
 		Romney Staffer
 -->
+@endverbatim
